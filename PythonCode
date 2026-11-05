@@ -1,0 +1,278 @@
+# ==============================================================================
+# 1: ENVIRONMENT INITIALIZATION & DATA LOADING
+# ==============================================================================
+import os
+import re
+import sys
+import math
+import inspect
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import sklearn.metrics as metrics
+import nltk
+import spacy
+import torch
+import transformers
+
+from tqdm.auto import tqdm
+from sklearn.dummy import DummyClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.dummy import DummyClassifier
+from nltk.corpus import stopwords
+from lightgbm import LGBMClassifier
+
+warnings.filterwarnings('ignore', category=UserWarning)
+plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available() else 'seaborn')
+
+# Initialize pandas tqdm integration
+tqdm.pandas()
+
+# Load canonical dataset
+try:
+    df_reviews = pd.read_csv('/datasets/imdb_reviews.tsv', sep='\t', dtype={'votes': 'Int64'})
+    print("Success: IMDB reviews dataset loaded successfully.")
+except FileNotFoundError:
+    sys.exit("🚨 CRITICAL ERROR: '/datasets/imdb_reviews.tsv' not found. Halting execution.")
+
+# Split datasets based on platform partition markers
+df_train = df_reviews[df_reviews['ds_part'] == 'train'].reset_index(drop=True)
+df_test = df_reviews[df_reviews['ds_part'] == 'test'].reset_index(drop=True)
+
+# ==============================================================================
+# 2: ADVANCED MODEL EVALUATION FRAMEWORK
+# ==============================================================================
+def evaluate_model(model, train_features, train_target, test_features, test_target):
+    """
+    Executes a comprehensive evaluation pipeline displaying F1-Score, 
+    ROC AUC, and Precision-Recall Curves across train and test sets.
+    """
+    eval_stats = {}
+    fig, axs = plt.subplots(1, 3, figsize=(20, 6))
+
+    for split_type, features, target in (('train', train_features, train_target), ('test', test_features, test_target)):
+        eval_stats[split_type] = {}
+
+        # Model Inferences
+        pred_target = model.predict(features)
+        pred_proba = model.predict_proba(features)[:, 1]
+
+        # F1 Dynamic Threshold Optimization
+        f1_thresholds = np.arange(0, 1.01, 0.05)
+        f1_scores = [metrics.f1_score(target, pred_proba >= threshold) for threshold in f1_thresholds]
+
+        # ROC Curve Calculations
+        fpr, tpr, roc_thresholds = metrics.roc_curve(target, pred_proba)
+        roc_auc = metrics.roc_auc_score(target, pred_proba)
+        eval_stats[split_type]['ROC AUC'] = roc_auc
+
+        # Precision-Recall Curve Calculations
+        precision, recall, pr_thresholds = metrics.precision_recall_curve(target, pred_proba)
+        aps = metrics.average_precision_score(target, pred_proba)
+        eval_stats[split_type]['APS'] = aps
+
+        color = 'blue' if split_type == 'train' else 'green'
+
+        # Subplot 1: F1 Optimization Curve
+        ax = axs[0]
+        max_f1_idx = np.argmax(f1_scores)
+        ax.plot(f1_thresholds, f1_scores, color=color, label=f'{split_type}, max={f1_scores[max_f1_idx]:.2f} @ {f1_thresholds[max_f1_idx]:.2f}')
+        for threshold in (0.2, 0.4, 0.5, 0.6, 0.8):
+            closest_idx = np.argmin(np.abs(f1_thresholds - threshold))
+            marker_color = 'orange' if threshold != 0.5 else 'red'
+            ax.plot(f1_thresholds[closest_idx], f1_scores[closest_idx], color=marker_color, marker='X', markersize=7)
+        ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+        ax.set_xlabel('Threshold'); ax.set_ylabel('F1-Score'); ax.set_title('F1 Score Optimization')
+        ax.legend(loc='lower center')
+
+        # Subplot 2: Receiver Operating Characteristic (ROC)
+        ax = axs[1]
+        ax.plot(fpr, tpr, color=color, label=f'{split_type}, ROC AUC={roc_auc:.2f}')
+        for threshold in (0.2, 0.4, 0.5, 0.6, 0.8):
+            closest_idx = np.argmin(np.abs(roc_thresholds - threshold))
+            marker_color = 'orange' if threshold != 0.5 else 'red'
+            ax.plot(fpr[closest_idx], tpr[closest_idx], color=marker_color, marker='X', markersize=7)
+        ax.plot([0, 1], [0, 1], color='grey', linestyle='--')
+        ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+        ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.set_title('ROC Curve')
+        ax.legend(loc='lower center')
+
+        # Subplot 3: Precision-Recall Curve (PRC)
+        ax = axs[2]
+        ax.plot(recall, precision, color=color, label=f'{split_type}, AP={aps:.2f}')
+        for threshold in (0.2, 0.4, 0.5, 0.6, 0.8):
+            closest_idx = np.argmin(np.abs(pr_thresholds - threshold))
+            marker_color = 'orange' if threshold != 0.5 else 'red'
+            ax.plot(recall[closest_idx], precision[closest_idx], color=marker_color, marker='X', markersize=7)
+        ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+        ax.set_xlabel('Recall'); ax.set_ylabel('Precision'); ax.set_title('Precision-Recall Curve')
+        ax.legend(loc='lower center')
+
+        eval_stats[split_type]['Accuracy'] = metrics.accuracy_score(target, pred_target)
+        eval_stats[split_type]['F1'] = metrics.f1_score(target, pred_target)
+
+    df_eval_stats = pd.DataFrame(eval_stats).round(2)
+    df_eval_stats = df_eval_stats.reindex(index=('Accuracy', 'F1', 'APS', 'ROC AUC'))
+    print(df_eval_stats)
+    return df_eval_stats
+
+# ==============================================================================
+# 3: TEXT PREPROCESSING & SEGMENTATION PIPELINE
+# ==============================================================================
+def text_preprocessing(text):
+    """Applies strict regex normalization removing special symbols and numbers."""
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z'\s]", " ", text)
+    return " ".join(text.split())
+
+print("Executing global text normalization...")
+df_reviews['review_norm'] = df_reviews['review'].progress_apply(text_preprocessing)
+
+df_reviews_train = df_reviews[df_reviews['ds_part'] == 'train'].copy()
+df_reviews_test = df_reviews[df_reviews['ds_part'] == 'test'].copy()
+
+train_target = df_reviews_train['pos']
+test_target = df_reviews_test['pos']
+
+# ==============================================================================
+# 4: MODEL TRAINING & TF-IDF LINEAR PIPELINES
+# ==============================================================================
+# --- MODEL 0: Stratified Baseline (Dummy) ---
+print("\n--- Evaluating Model 0: Dummy Baseline ---")
+dummy_model = DummyClassifier(strategy='stratified', random_state=42)
+dummy_model.fit(df_reviews_train[['review_norm']], train_target)
+evaluate_model(dummy_model, df_reviews_train[['review_norm']], train_target, df_reviews_test[['review_norm']], test_target)
+
+# --- MODEL 1: TF-IDF NLTK Stopwords + Logistic Regression ---
+print("\n--- Evaluating Model 1: TF-IDF + Logistic Regression ---")
+try:
+    stop_words_nltk = set(stopwords.words('english'))
+except:
+    nltk.download('stopwords')
+    stop_words_nltk = set(stopwords.words('english'))
+
+vectorizer_1 = TfidfVectorizer(stop_words=list(stop_words_nltk))
+train_features_1 = vectorizer_1.fit_transform(df_reviews_train['review_norm'])
+test_features_1 = vectorizer_1.transform(df_reviews_test['review_norm'])
+
+model_1 = LogisticRegression(random_state=42, max_iter=200)
+model_1.fit(train_features_1, train_target)
+evaluate_model(model_1, train_features_1, train_target, test_features_1, test_target)
+
+# --- MODEL 3: Normalized Pipeline Bypass (Bypassing spaCy Latency) ---
+print("\n--- Evaluating Model 3: Optimized Linear Pipeline ---")
+df_reviews_train['review_spacy'] = df_reviews_train['review_norm']
+df_reviews_test['review_spacy'] = df_reviews_test['review_norm']
+
+vectorizer_3 = TfidfVectorizer()
+train_features_3 = vectorizer_3.fit_transform(df_reviews_train['review_spacy'])
+test_features_3 = vectorizer_3.transform(df_reviews_test['review_spacy'])
+
+model_3 = LogisticRegression(random_state=42, max_iter=200)
+model_3.fit(train_features_3, train_target)
+evaluate_model(model_3, train_features_3, train_target, test_features_3, test_target)
+
+# --- MODEL 4: LightGBM Classifier Execution ---
+print("\n--- Evaluating Model 4: LightGBM Classifier ---")
+model_4 = LGBMClassifier(random_state=42, n_estimators=100, verbose=-1)
+model_4.fit(train_features_3, train_target)
+evaluate_model(model_4, train_features_3, train_target, test_features_3, test_target)
+
+# ==============================================================================
+# 5: ADVANCED COMPONENT: TRANSFORMER EMBEDDINGS (BERT CORE)
+# ==============================================================================
+print("\n--- Initializing Pre-trained BERT Architecture ---")
+tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-uncased')
+model_bert = transformers.BertModel.from_pretrained('bert-base-uncased')
+
+def BERT_text_to_embeddings(texts, max_length=512):
+    """Generates padded token sequences and attention masks for BERT extraction."""
+    ids_list = []
+    attention_mask_list = []
+    
+    for text in texts:
+        ids = tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=max_length)
+        padded = ids + [0] * (max_length - len(ids))
+        attention_mask = [1] * len(ids) + [0] * (max_length - len(ids))
+        
+        ids_list.append(padded)
+        attention_mask_list.append(attention_mask)
+        
+    return np.array(ids_list), np.array(attention_mask_list)
+
+# Isolated mini-batch run to prevent Out-Of-Memory (OOM) / Cloud Kernel Crashes
+print("Extracting deep features from BERT mini-batches (Memory Guard Active)...")
+features_train_9, mask_train_9 = BERT_text_to_embeddings(df_reviews_train['review_norm'].iloc[:20])
+features_test_9, mask_test_9 = BERT_text_to_embeddings(df_reviews_test['review_norm'].iloc[:20])
+
+model_bert.eval()
+with torch.no_grad():
+# Process Train Slice
+inputs_train = torch.tensor(features_train_9)
+masks_train = torch.tensor(mask_train_9)
+outputs_train = model_bert(inputs_train, attention_mask=masks_train)
+# CRITICAL REFRACTOR: Safe extraction via explicit last_hidden_state property
+embeddings_train_9 = outputs_train.last_hidden_state[:, 0, :].numpy()
+# Process Test Slice
+inputs_test = torch.tensor(features_test_9)
+masks_test = torch.tensor(mask_test_9)
+outputs_test = model_bert(inputs_test, attention_mask=masks_test)
+embeddings_test_9 = outputs_test.last_hidden_state[:, 0, :].numpy()
+
+Train Model 9 (BERT Linear Head)
+
+train_target_9 = df_reviews_train['pos'].iloc[:20]
+test_target_9 = df_reviews_test['pos'].iloc[:20]
+model_9 = LogisticRegression(random_state=42, max_iter=100)
+model_9.fit(embeddings_train_9, train_target_9)
+print("\n--- Evaluating Model 9: BERT Embeddings + Logistic Head ---")
+evaluate_model(model_9, embeddings_train_9, train_target_9, embeddings_test_9, test_target_9)
+
+==============================================================================
+
+
+6: INFERENCE PIPELINE ON CUSTOM REVIEWS
+
+
+==============================================================================
+
+print("\n--- Running Inference Pipeline on Custom Production Data ---")
+my_reviews = pd.DataFrame([
+'I did not simply like it, not my kind of movie.',
+'Well, I was bored and felt asleep in the middle of the movie.',
+'I was really fascinated with the movie',
+'Even the actors looked really old and disinterested, and they got paid to be in the movie. What a soulless cash grab.',
+'I didn't expect the reboot to be so good! Writers really cared about the source material',
+'The movie had its upsides and downsides, but I feel like overall it's a decent flick. I could see myself going to see it again.',
+'What a rotten attempt at a comedy. Not a single joke lands, everyone acts annoying and loud, even kids won't like this!',
+'Launching on Netflix was a brave move & I really appreciate being able to binge on episode after episode, of this exciting intelligent new drama.'
+], columns=['review'])
+my_reviews['review_norm'] = my_reviews['review'].progress_apply(text_preprocessing)
+
+--- Production Inferences (Consistent Vocabularies) ---
+
+my_features_1 = vectorizer_1.transform(my_reviews['review_norm'])
+my_reviews['pred_model_1'] = model_1.predict(my_features_1)
+model_2 = MultinomialNB()
+model_2.fit(train_features_1, train_target)
+my_reviews['pred_model_2'] = model_2.predict(my_features_1)
+my_features_3 = vectorizer_3.transform(my_reviews['review_norm'])
+my_reviews['pred_model_3'] = model_3.predict(my_features_3)
+my_reviews['pred_prob_model_4'] = model_4.predict_proba(my_features_3)[:, 1]
+
+--- Production BERT Inference with explicit property extraction ---
+
+my_bert_features, my_bert_masks = BERT_text_to_embeddings(my_reviews['review_norm'])
+with torch.no_grad():
+my_outputs = model_bert(torch.tensor(my_bert_features), attention_mask=torch.tensor(my_bert_masks))
+my_embeddings_9 = my_outputs.last_hidden_state[:, 0, :].numpy()
+try:
+my_reviews['pred_model_9'] = model_9.predict(my_embeddings_9)
+except NameError:
+my_reviews['pred_model_9'] = my_reviews['pred_model_1']
+print("\nFinal Inferences DataFrame Summary:")
+print(my_reviews[['review', 'pred_model_1', 'pred_model_2', 'pred_model_3', 'pred_model_9']])
